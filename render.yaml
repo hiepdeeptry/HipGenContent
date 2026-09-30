@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: hipne
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: DEEPSEEK_API_KEY
+        sync: false        # nhập tay trên dashboard Render
+      - key: APP_PASSWORD
+        sync: false        # nhập tay trên dashboard Render
