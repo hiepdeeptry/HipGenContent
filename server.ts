@@ -19,10 +19,20 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// (Tuỳ chọn) Khoá toàn bộ web bằng mật khẩu — chỉ bật khi có APP_PASSWORD.
-// Nên bật, vì URL Render là public: ai biết link đều dùng được API key của bạn.
-const APP_USERNAME = process.env.APP_USERNAME || 'admin';
+// ---------------------------------------------------------------------------
+// (Tuỳ chọn) Khoá web bằng mật khẩu — chỉ bật khi có APP_PASSWORD.
+// Đăng nhập 1 lần, máy đó được nhớ 1 năm (cookie ký HMAC, HttpOnly).
+// Đổi APP_PASSWORD => mọi máy bị đăng xuất.
+// ---------------------------------------------------------------------------
 const APP_PASSWORD = process.env.APP_PASSWORD;
+const COOKIE_NAME = 'ath_auth';
+const COOKIE_MAX_AGE_MS = 365 * 24 * 60 * 60 * 1000;
+const SESSION_SECRET = crypto
+  .createHash('sha256')
+  .update(`${APP_PASSWORD ?? ''}|${process.env.SESSION_SECRET ?? ''}`)
+  .digest();
+
+app.set('trust proxy', 1); // Render đứng sau proxy HTTPS
 
 function safeEqual(a: string, b: string) {
   const ha = crypto.createHash('sha256').update(a).digest();
@@ -30,19 +40,93 @@ function safeEqual(a: string, b: string) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
-app.use((req, res, next) => {
-  if (!APP_PASSWORD) return next();
-  const [scheme, encoded] = (req.headers.authorization || '').split(' ');
-  if (scheme === 'Basic' && encoded) {
-    const decoded = Buffer.from(encoded, 'base64').toString();
-    const idx = decoded.indexOf(':');
-    const user = decoded.slice(0, idx);
-    const pass = decoded.slice(idx + 1);
-    if (safeEqual(user, APP_USERNAME) && safeEqual(pass, APP_PASSWORD)) return next();
+function signToken(expiresAt: number) {
+  const payload = String(expiresAt);
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifyToken(token: string | undefined) {
+  if (!token) return false;
+  const [payload, sig] = token.split('.');
+  if (!payload || !sig) return false;
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return safeEqual(sig, expected) && Number(payload) > Date.now();
+}
+
+function getCookie(req: express.Request, name: string) {
+  const raw = req.headers.cookie || '';
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i > -1 && part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
   }
-  res.set('WWW-Authenticate', 'Basic realm="HipNè"');
-  return res.status(401).send('Cần đăng nhập để sử dụng.');
-});
+  return undefined;
+}
+
+// Chống dò mật khẩu: tối đa 10 lần sai / 15 phút / IP
+const failedLogins = new Map<string, { count: number; resetAt: number }>();
+
+function loginPage(error = '') {
+  return `<!doctype html><html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Đăng nhập</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f4f7fb;font-family:system-ui,sans-serif}
+form{background:#fff;padding:32px;border-radius:24px;box-shadow:0 10px 30px #0001;width:min(340px,90vw)}
+h1{margin:0 0 4px;font-size:20px;color:#1d4ed8}p{margin:0 0 20px;font-size:12px;color:#94a3b8}
+input{width:100%;box-sizing:border-box;padding:12px 14px;border:1px solid #e2e8f0;border-radius:14px;font-size:14px}
+button{width:100%;margin-top:12px;padding:12px;border:0;border-radius:14px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer}
+.err{color:#dc2626;font-size:12px;margin-top:10px}
+</style></head><body>
+<form method="POST" action="/login">
+<h1>ATH - CONTENT GEN</h1><p>Nhập mật khẩu. Máy này sẽ được ghi nhớ.</p>
+<input type="password" name="password" placeholder="Mật khẩu" autofocus required>
+<button type="submit">Đăng nhập</button>
+${error ? `<div class="err">${error}</div>` : ''}
+</form></body></html>`;
+}
+
+if (APP_PASSWORD) {
+  app.get('/login', (_req, res) => res.type('html').send(loginPage()));
+
+  app.post('/login', express.urlencoded({ extended: false }), (req, res) => {
+    const ip = req.ip || 'unknown';
+    const now = Date.now();
+    const rec = failedLogins.get(ip);
+    if (rec && rec.resetAt > now && rec.count >= 10) {
+      return res.status(429).type('html').send(loginPage('Sai quá nhiều lần. Thử lại sau 15 phút.'));
+    }
+
+    if (typeof req.body.password === 'string' && safeEqual(req.body.password, APP_PASSWORD)) {
+      failedLogins.delete(ip);
+      res.cookie(COOKIE_NAME, signToken(now + COOKIE_MAX_AGE_MS), {
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: req.secure,
+        maxAge: COOKIE_MAX_AGE_MS,
+      });
+      return res.redirect('/');
+    }
+
+    failedLogins.set(ip, {
+      count: rec && rec.resetAt > now ? rec.count + 1 : 1,
+      resetAt: rec && rec.resetAt > now ? rec.resetAt : now + 15 * 60 * 1000,
+    });
+    return res.status(401).type('html').send(loginPage('Sai mật khẩu.'));
+  });
+
+  app.get('/logout', (_req, res) => {
+    res.clearCookie(COOKIE_NAME);
+    res.redirect('/login');
+  });
+
+  app.use((req, res, next) => {
+    if (verifyToken(getCookie(req, COOKIE_NAME))) return next();
+    if (req.path.startsWith('/api/')) {
+      return res.status(401).json({ error: 'Chưa đăng nhập. Hãy tải lại trang để đăng nhập.' });
+    }
+    return res.redirect('/login');
+  });
+}
 
 // YouTube oEmbed proxy to bypass any CORS restrictions in browser
 app.get('/api/youtube-info', async (req, res) => {
@@ -135,6 +219,24 @@ app.post('/api/deepseek', async (req, res) => {
   }
 });
 
+// Tự ping mỗi 3 phút để Render (gói Free) không cho service "ngủ" sau 15 phút không có request.
+// RENDER_EXTERNAL_URL do Render tự cung cấp; có thể ghi đè bằng SELF_PING_URL.
+function startKeepAlive() {
+  const base = process.env.SELF_PING_URL || process.env.RENDER_EXTERNAL_URL;
+  if (process.env.NODE_ENV !== 'production' || !base) return;
+  const url = `${base.replace(/\/+$/, '')}/api/health`;
+  const INTERVAL_MS = 3 * 60 * 1000;
+  setInterval(async () => {
+    try {
+      const r = await fetch(url);
+      console.log(`[keep-alive] ${r.status}`);
+    } catch (e: any) {
+      console.warn('[keep-alive] failed:', e.message);
+    }
+  }, INTERVAL_MS);
+  console.log(`[keep-alive] ping ${url} mỗi 3 phút`);
+}
+
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -152,6 +254,7 @@ async function startServer() {
 
   app.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
+    startKeepAlive();
   });
 }
 
