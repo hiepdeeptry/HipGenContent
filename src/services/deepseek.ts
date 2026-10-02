@@ -34,11 +34,10 @@ export async function callDeepSeek(options: DeepSeekRequestOptions): Promise<str
 export function extractTranslationTag(text: string): string {
   if (!text) return '';
   const match = text.match(/<translation>([\s\S]*?)<\/translation>/i);
-  if (match && match[1]) {
-    return match[1].trim();
-  }
-  // Strip any accidental leading/trailing markdown or quotes
-  return text.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
+  let out = match && match[1] ? match[1] : text;
+  // Gỡ mọi thẻ <translation> còn sót (kể cả khi thiếu thẻ đóng do bị cắt)
+  out = out.replace(/<\/?translation>/gi, '');
+  return out.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
 }
 
 export async function translateTitle(
@@ -89,7 +88,7 @@ QUY TẮC ĐẦU RA (CRITICAL):
   const raw = await callDeepSeek({
     prompt,
     systemInstruction,
-    maxTokens: 3500,
+    maxTokens: 8000,
   });
 
   return extractTranslationTag(raw);

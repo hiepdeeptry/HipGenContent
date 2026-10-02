@@ -8,7 +8,6 @@ import {
   GenerationResult,
   SessionItem,
   TargetLanguage,
-  ChunkTranslation,
 } from './types.ts';
 import { TARGET_LANGUAGES } from './constants/languages.ts';
 import {
@@ -226,28 +225,54 @@ export default function App() {
     }
   };
 
-  // Chunking utility for large story texts
-  const chunkText = (text: string, maxChunkLength = 4000): string[] => {
-    if (text.length <= maxChunkLength) return [text];
+  // Tách văn bản dài thành các phần ~15.000 ký tự, cắt tại cuối đoạn / cuối câu.
+  // `seps` = khoảng trắng gốc giữa phần i và i+1, dùng để ghép lại đúng bố cục.
+  const chunkText = (
+    text: string,
+    maxChunkLength = 10000
+  ): { chunks: string[]; seps: string[] } => {
+    const src = text.trim();
+    if (src.length <= maxChunkLength) return { chunks: [src], seps: [] };
 
-    const paragraphs = text.split(/\n\s*\n/);
     const chunks: string[] = [];
-    let currentChunk = '';
+    const seps: string[] = [];
+    const minCut = Math.floor(maxChunkLength * 0.5); // tránh cắt quá sớm
+    const sentenceEnd = /(?:[.!?…]["'”’»)\]]*(?=\s)|[。！？]["'”’»)\]」』]*)/g;
+    let rest = src;
 
-    for (const para of paragraphs) {
-      if ((currentChunk + '\n\n' + para).length > maxChunkLength && currentChunk.trim()) {
-        chunks.push(currentChunk.trim());
-        currentChunk = para;
-      } else {
-        currentChunk = currentChunk ? currentChunk + '\n\n' + para : para;
+    while (rest.length > maxChunkLength) {
+      const win = rest.slice(0, maxChunkLength);
+      let cut = -1;
+
+      // Ưu tiên 1: cuối đoạn văn (dòng trống)
+      const para = win.lastIndexOf('\n\n');
+      if (para >= minCut) cut = para;
+
+      // Ưu tiên 2: cuối câu (. ! ? … 。！？)
+      if (cut < 0) {
+        let last = -1;
+        for (const m of win.matchAll(sentenceEnd)) last = m.index! + m[0].length;
+        if (last >= minCut) cut = last;
       }
+
+      // Ưu tiên 3: xuống dòng / khoảng trắng gần nhất
+      if (cut < 0) {
+        const sp = Math.max(win.lastIndexOf('\n'), win.lastIndexOf(' '));
+        if (sp >= minCut) cut = sp;
+      }
+
+      // Cuối cùng: cắt cứng
+      if (cut < 0) cut = maxChunkLength;
+
+      chunks.push(rest.slice(0, cut).trim());
+      const tail = rest.slice(cut);
+      const ws = tail.match(/^\s*/)![0];
+      seps.push(ws.includes('\n\n') ? '\n\n' : ws.includes('\n') ? '\n' : ws ? ' ' : '');
+      rest = tail.slice(ws.length);
     }
 
-    if (currentChunk.trim()) {
-      chunks.push(currentChunk.trim());
-    }
-
-    return chunks.length > 0 ? chunks : [text];
+    if (rest.trim()) chunks.push(rest.trim());
+    return { chunks, seps };
   };
 
   // Main Generation Handler
@@ -279,24 +304,35 @@ export default function App() {
         }
       }
 
-      // 2. Dịch Đoạn Văn Học / Chia nhỏ nội dung nếu lớn
+      // 2. Dịch văn bản: tách ~15.000 ký tự theo dấu câu, gửi song song, ghép lại thành 1 bản
       const textToTranslate = inputText.trim() || originalTitle;
-      const textChunks = chunkText(textToTranslate);
-      const translatedChunks: ChunkTranslation[] = [];
+      const { chunks: textChunks, seps } = chunkText(textToTranslate);
 
-      for (let i = 0; i < textChunks.length; i++) {
-        setGenerationStep(`Đang dịch văn học (Đoạn ${i + 1}/${textChunks.length})...`);
-        const chunkTextContent = textChunks[i];
-        const translatedContent = await translateStoryChunk(chunkTextContent, targetLang);
-        translatedChunks.push({
-          chunkIndex: i + 1,
-          originalText: chunkTextContent,
-          translatedText: translatedContent,
-          charCount: translatedContent.length,
-        });
-      }
+      let doneCount = 0;
+      const updateStep = () =>
+        setGenerationStep(
+          `Đang dịch văn học (${doneCount}/${textChunks.length} phần hoàn tất)...`
+        );
+      updateStep();
 
-      const fullTranslation = translatedChunks.map((c) => c.translatedText).join('\n\n');
+      const translatedParts = await Promise.all(
+        textChunks.map(async (part) => {
+          let result: string;
+          try {
+            result = await translateStoryChunk(part, targetLang);
+          } catch {
+            result = await translateStoryChunk(part, targetLang); // thử lại 1 lần
+          }
+          doneCount++;
+          updateStep();
+          return result;
+        })
+      );
+
+      const fullTranslation = translatedParts.reduce(
+        (acc, part, i) => acc + part + (i < translatedParts.length - 1 ? seps[i] : ''),
+        ''
+      );
 
       // 3. Tạo Mô Tả YouTube (4 phần chuẩn viral)
       setGenerationStep('Đang tạo mô tả YouTube chuyên nghiệp...');
@@ -328,7 +364,7 @@ export default function App() {
         youtubeTranslatedTitle: translatedTitle || undefined,
         thumbnailUrl: videoId ? getYouTubeThumbnails(videoId).maxRes : undefined,
         targetLanguage: targetLang.id,
-        chunks: translatedChunks,
+        chunks: [],
         fullTranslation,
         youtubeDescription,
         seoTags,
@@ -729,36 +765,14 @@ export default function App() {
 
                   {!translationCollapsed && (
                     <div className="space-y-4 pt-1">
-                      {currentResult.chunks && currentResult.chunks.length > 0 ? (
-                        currentResult.chunks.map((chunk) => (
-                          <div
-                            key={chunk.chunkIndex}
-                            className="rounded-2xl border border-slate-100 bg-slate-50/50 p-4 space-y-3"
-                          >
-                            <div className="flex items-center justify-between text-xs text-slate-500 pb-2 border-b border-slate-200/60">
-                              <span className="font-bold tracking-wider uppercase text-slate-600">
-                                ĐOẠN {chunk.chunkIndex} ({chunk.charCount.toLocaleString('vi-VN')} KÝ TỰ)
-                              </span>
-                              <button
-                                onClick={() =>
-                                  copyToClipboard(chunk.translatedText, `đoạn ${chunk.chunkIndex}`)
-                                }
-                                className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 hover:bg-slate-100 text-[11px] font-semibold text-slate-700 flex items-center gap-1 transition-colors cursor-pointer shadow-2xs"
-                              >
-                                <Copy className="w-3 h-3" />
-                                Copy đoạn
-                              </button>
-                            </div>
-                            <div className="text-sm text-slate-800 leading-relaxed font-serif whitespace-pre-line">
-                              {chunk.translatedText}
-                            </div>
-                          </div>
-                        ))
-                      ) : (
-                        <div className="p-4 rounded-2xl bg-slate-50 border border-slate-100 text-sm text-slate-800 leading-relaxed font-serif whitespace-pre-line">
+                      <div className="rounded-2xl border border-slate-100 bg-slate-50/50 p-4 space-y-3">
+                        <div className="text-xs font-bold tracking-wider uppercase text-slate-500 pb-2 border-b border-slate-200/60">
+                          {currentResult.fullTranslation.length.toLocaleString('vi-VN')} KÝ TỰ
+                        </div>
+                        <div className="text-sm text-slate-800 leading-relaxed font-serif whitespace-pre-line">
                           {currentResult.fullTranslation}
                         </div>
-                      )}
+                      </div>
                     </div>
                   )}
                 </div>
