@@ -31,13 +31,32 @@ export async function callDeepSeek(options: DeepSeekRequestOptions): Promise<str
   return content.trim();
 }
 
+/**
+ * Xóa các ký hiệu nhiễu thường có trong transcript:
+ *  - Thẻ trong ngoặc vuông: [music], [hắng giọng], [odkašlání], [...]
+ *  - Dấu chuyển người nói: >> và <<
+ * Sau đó dọn khoảng trắng thừa nhưng vẫn giữ nguyên xuống dòng / đoạn văn.
+ */
+export function cleanNoiseMarkers(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/\[[^\]\n]*\]/g, '')
+    .replace(/>{2,}|<{2,}/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/^[ \t]+/gm, '')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 export function extractTranslationTag(text: string): string {
   if (!text) return '';
   const match = text.match(/<translation>([\s\S]*?)<\/translation>/i);
   let out = match && match[1] ? match[1] : text;
   // Gỡ mọi thẻ <translation> còn sót (kể cả khi thiếu thẻ đóng do bị cắt)
   out = out.replace(/<\/?translation>/gi, '');
-  return out.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '').trim();
+  out = out.replace(/^```[\w]*\n?/, '').replace(/\n?```$/, '');
+  return cleanNoiseMarkers(out);
 }
 
 export async function translateTitle(

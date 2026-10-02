@@ -21,6 +21,7 @@ import {
   translateStoryChunk,
   generateYouTubeDescription,
   generateSeoTags,
+  cleanNoiseMarkers,
 } from './services/deepseek.ts';
 import { Sidebar } from './components/Sidebar.tsx';
 import { ThumbnailModal } from './components/ThumbnailModal.tsx';
@@ -229,7 +230,7 @@ export default function App() {
   // `seps` = khoảng trắng gốc giữa phần i và i+1, dùng để ghép lại đúng bố cục.
   const chunkText = (
     text: string,
-    maxChunkLength = 10000
+    maxChunkLength = 15000
   ): { chunks: string[]; seps: string[] } => {
     const src = text.trim();
     if (src.length <= maxChunkLength) return { chunks: [src], seps: [] };
@@ -305,7 +306,8 @@ export default function App() {
       }
 
       // 2. Dịch văn bản: tách ~15.000 ký tự theo dấu câu, gửi song song, ghép lại thành 1 bản
-      const textToTranslate = inputText.trim() || originalTitle;
+      // Làm sạch [music], [hắng giọng], >> << trước khi tách đoạn & dịch
+      const textToTranslate = cleanNoiseMarkers(inputText.trim() || originalTitle);
       const { chunks: textChunks, seps } = chunkText(textToTranslate);
 
       let doneCount = 0;
@@ -769,7 +771,7 @@ export default function App() {
                         <div className="text-xs font-bold tracking-wider uppercase text-slate-500 pb-2 border-b border-slate-200/60">
                           {currentResult.fullTranslation.length.toLocaleString('vi-VN')} KÝ TỰ
                         </div>
-                        <div className="text-sm text-slate-800 leading-relaxed font-serif whitespace-pre-line">
+                        <div className="max-h-[480px] overflow-y-auto pr-2 text-sm text-slate-800 leading-relaxed font-serif whitespace-pre-line">
                           {currentResult.fullTranslation}
                         </div>
                       </div>
