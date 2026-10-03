@@ -52,7 +52,20 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionItem[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY_SESSIONS);
-      if (saved) return JSON.parse(saved);
+      if (saved) {
+        const parsed: SessionItem[] = JSON.parse(saved);
+        // Phiên đang chạy mà trang bị tải lại thì tiến trình đã mất -> đánh dấu lỗi
+        return parsed.map((x) =>
+          x.status === 'running'
+            ? {
+                ...x,
+                status: 'error' as const,
+                step: undefined,
+                error: 'Bị gián đoạn do tải lại trang. Chọn phiên này rồi bấm "BẮT ĐẦU TẠO" để chạy lại.',
+              }
+            : x
+        );
+      }
     } catch (e) {
       console.warn('Failed to parse sessions:', e);
     }
@@ -71,12 +84,19 @@ export default function App() {
   const [youtubeInfo, setYoutubeInfo] = useState<YouTubeInfo | null>(null);
   const [loadingYoutube, setLoadingYoutube] = useState(false);
 
-  // Generation Results State: null on new session / load
-  const [currentResult, setCurrentResult] = useState<GenerationResult | null>(null);
+  // Kết quả / trạng thái chạy được suy ra từ phiên đang xem (mỗi phiên chạy độc lập)
+  const currentSession = sessions.find((x) => x.id === currentSessionId) || null;
+  const currentResult: GenerationResult | null = currentSession ? currentSession.data : null;
+  const isGenerating = currentSession?.status === 'running';
+  const generationStep = currentSession?.step || '';
+
+  // Ref để các tác vụ chạy nền luôn đọc được trạng thái mới nhất
+  const sessionsRef = useRef(sessions);
+  sessionsRef.current = sessions;
+  const currentSessionIdRef = useRef(currentSessionId);
+  currentSessionIdRef.current = currentSessionId;
 
   // UI state
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [generationStep, setGenerationStep] = useState<string>('');
   const [showThumbnailModal, setShowThumbnailModal] = useState(false);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [translationCollapsed, setTranslationCollapsed] = useState(false);
@@ -103,10 +123,33 @@ export default function App() {
     }
   };
 
-  // Save sessions to LocalStorage
-  const saveSessions = (updated: SessionItem[]) => {
-    setSessions(updated);
-    localStorage.setItem(STORAGE_KEY_SESSIONS, JSON.stringify(updated));
+  // Lưu lịch sử vào localStorage mỗi khi danh sách phiên thay đổi
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY_SESSIONS, JSON.stringify(sessions));
+    } catch (e) {
+      console.warn('Không thể lưu lịch sử phiên (có thể đã đầy bộ nhớ):', e);
+    }
+  }, [sessions]);
+
+  // Cập nhật một phiên theo id — an toàn khi nhiều phiên chạy song song
+  const patchSession = (
+    id: string,
+    patch: Partial<Omit<SessionItem, 'data'>> & { data?: Partial<GenerationResult> }
+  ) => {
+    setSessions((prev) =>
+      prev.map((x) =>
+        x.id === id ? { ...x, ...patch, data: { ...x.data, ...(patch.data || {}) } } : x
+      )
+    );
+  };
+
+  // Tự đặt tên phiên (bỏ qua nếu người dùng đã tự đổi tên)
+  const setAutoTitle = (id: string, title: string) => {
+    if (!title) return;
+    setSessions((prev) =>
+      prev.map((x) => (x.id === id && !x.titleEdited ? { ...x, title } : x))
+    );
   };
 
   // Xóa API key cũ (nếu có) còn sót trong localStorage của trình duyệt
@@ -150,10 +193,9 @@ export default function App() {
 
   // Handle selecting a session from history
   const handleSelectSession = (id: string) => {
-    const found = sessions.find((s) => s.id === id);
+    const found = sessions.find((x) => x.id === id);
     if (found) {
       setCurrentSessionId(found.id);
-      setCurrentResult(found.data);
       setInputText(found.data.originalText || '');
       setYoutubeUrl(found.data.youtubeUrl || '');
       setSelectedLanguageId(found.data.targetLanguage || 'vi');
@@ -171,10 +213,9 @@ export default function App() {
     }
   };
 
-  // Handle New Session
+  // Tạo phiên mới (form trống). Các phiên đang chạy vẫn tiếp tục chạy nền.
   const handleNewSession = () => {
     setCurrentSessionId(null);
-    setCurrentResult(null);
     setInputText('');
     setYoutubeUrl('');
     setYoutubeInfo(null);
@@ -184,8 +225,15 @@ export default function App() {
   // Handle Delete Session
   const handleDeleteSession = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    const updated = sessions.filter((s) => s.id !== id);
-    saveSessions(updated);
+    const target = sessions.find((x) => x.id === id);
+    if (
+      target?.status === 'running' &&
+      !window.confirm('Phiên này đang chạy. Xóa sẽ dừng các bước còn lại. Vẫn xóa?')
+    ) {
+      return;
+    }
+    const updated = sessions.filter((x) => x.id !== id);
+    setSessions(updated);
     if (currentSessionId === id) {
       if (updated.length > 0) {
         handleSelectSession(updated[0].id);
@@ -196,10 +244,23 @@ export default function App() {
     showToast('Đã xóa phiên khỏi lịch sử.');
   };
 
+  // Đổi tên phiên
+  const handleRenameSession = (id: string, title: string) => {
+    const t = title.trim();
+    if (!t) return;
+    setSessions((prev) =>
+      prev.map((x) => (x.id === id ? { ...x, title: t, titleEdited: true } : x))
+    );
+  };
+
   // Handle Clear All Sessions
   const handleClearAllSessions = () => {
-    if (window.confirm('Bạn có chắc chắn muốn xóa toàn bộ lịch sử các phiên không?')) {
-      saveSessions([]);
+    const running = sessions.some((x) => x.status === 'running');
+    const msg = running
+      ? 'Có phiên đang chạy. Xóa tất cả sẽ dừng các bước còn lại của chúng. Vẫn xóa toàn bộ lịch sử?'
+      : 'Bạn có chắc chắn muốn xóa toàn bộ lịch sử các phiên không?';
+    if (window.confirm(msg)) {
+      setSessions([]);
       handleNewSession();
       showToast('Đã xóa tất cả các phiên.');
     }
@@ -276,45 +337,93 @@ export default function App() {
     return { chunks, seps };
   };
 
-  // Main Generation Handler
+  // Main Generation Handler — mỗi lần bấm tạo một phiên riêng, chạy nền độc lập
   const handleStartGeneration = async () => {
     if (!inputText.trim() && !youtubeUrl.trim()) {
       showToast('Vui lòng dán văn bản nội dung hoặc link YouTube!');
       return;
     }
+    if (isGenerating) return; // phiên đang xem vẫn đang chạy
 
     const targetLang =
       TARGET_LANGUAGES.find((l) => l.id === selectedLanguageId) || TARGET_LANGUAGES[0];
 
-    setIsGenerating(true);
-    setGenerationStep('Đang khởi tạo...');
+    // Chụp lại đầu vào tại thời điểm bấm (người dùng có thể đổi form ngay sau đó)
+    const rawText = inputText;
+    const url = youtubeUrl;
+    const videoId = extractYouTubeVideoId(url);
+    const originalTitle = youtubeInfo?.title || '';
+
+    const now = new Date();
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(
+      now.getMinutes()
+    ).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')} • ${now.getDate()}/${
+      now.getMonth() + 1
+    }/${now.getFullYear()}`;
+
+    const sessionId = `session-${Date.now()}`;
+    const initialTitle =
+      originalTitle ||
+      rawText.slice(0, 32).replace(/\n/g, ' ') + (rawText.length > 32 ? '...' : '') ||
+      'Phiên dịch mới';
+
+    const newSession: SessionItem = {
+      id: sessionId,
+      title: initialTitle,
+      timestamp: timeStr,
+      createdAt: Date.now(),
+      status: 'running',
+      step: 'Đang khởi tạo...',
+      data: {
+        id: sessionId,
+        timestamp: timeStr,
+        originalText: rawText,
+        youtubeUrl: url,
+        youtubeVideoId: videoId || undefined,
+        youtubeOriginalTitle: originalTitle || undefined,
+        thumbnailUrl: videoId ? getYouTubeThumbnails(videoId).maxRes : undefined,
+        targetLanguage: targetLang.id,
+        chunks: [],
+        fullTranslation: '',
+        youtubeDescription: '',
+        seoTags: '',
+      },
+    };
+
+    sessionsRef.current = [newSession, ...sessionsRef.current];
+    setSessions((prev) => [newSession, ...prev]);
+    setCurrentSessionId(sessionId);
+
+    // Phiên đã bị xóa giữa chừng thì dừng các bước còn lại
+    const alive = () => sessionsRef.current.some((x) => x.id === sessionId);
+    const setStep = (step: string) => patchSession(sessionId, { step });
+    const titleOf = () =>
+      sessionsRef.current.find((x) => x.id === sessionId)?.title || 'Phiên dịch';
+    const isViewing = () => currentSessionIdRef.current === sessionId;
 
     try {
-      const videoId = extractYouTubeVideoId(youtubeUrl);
-      let originalTitle = youtubeInfo?.title || '';
-      let translatedTitle = '';
-
-      // 1. Dịch Tiêu Đề (Nếu có tiêu đề YouTube)
+      // 1. Dịch Tiêu Đề (nếu có tiêu đề YouTube)
       if (originalTitle) {
-        setGenerationStep('Đang dịch tiêu đề nguyên nghĩa...');
+        setStep('Đang dịch tiêu đề nguyên nghĩa...');
+        let translatedTitle = originalTitle; // fallback
         try {
           translatedTitle = await translateTitle(originalTitle, targetLang);
-        } catch (err: any) {
+        } catch (err) {
           console.warn('Translate title error:', err);
-          translatedTitle = originalTitle; // fallback
         }
+        if (!alive()) return;
+        patchSession(sessionId, { data: { youtubeTranslatedTitle: translatedTitle } });
+        setAutoTitle(sessionId, translatedTitle);
       }
 
       // 2. Dịch văn bản: tách ~15.000 ký tự theo dấu câu, gửi song song, ghép lại thành 1 bản
       // Làm sạch [music], [hắng giọng], >> << trước khi tách đoạn & dịch
-      const textToTranslate = cleanNoiseMarkers(inputText.trim() || originalTitle);
+      const textToTranslate = cleanNoiseMarkers(rawText.trim() || originalTitle);
       const { chunks: textChunks, seps } = chunkText(textToTranslate);
 
       let doneCount = 0;
       const updateStep = () =>
-        setGenerationStep(
-          `Đang dịch văn học (${doneCount}/${textChunks.length} phần hoàn tất)...`
-        );
+        setStep(`Đang dịch văn học (${doneCount}/${textChunks.length} phần hoàn tất)...`);
       updateStep();
 
       const translatedParts = await Promise.all(
@@ -326,7 +435,7 @@ export default function App() {
             result = await translateStoryChunk(part, targetLang); // thử lại 1 lần
           }
           doneCount++;
-          updateStep();
+          if (alive()) updateStep();
           return result;
         })
       );
@@ -335,69 +444,33 @@ export default function App() {
         (acc, part, i) => acc + part + (i < translatedParts.length - 1 ? seps[i] : ''),
         ''
       );
+      if (!alive()) return;
+      patchSession(sessionId, { data: { fullTranslation } });
 
       // 3. Tạo Mô Tả YouTube (4 phần chuẩn viral)
-      setGenerationStep('Đang tạo mô tả YouTube chuyên nghiệp...');
+      setStep('Đang tạo mô tả YouTube chuyên nghiệp...');
       const storyContext = fullTranslation || textToTranslate;
-      const youtubeDescription = await generateYouTubeDescription(
-        storyContext,
-        targetLang
-      );
+      const youtubeDescription = await generateYouTubeDescription(storyContext, targetLang);
+      if (!alive()) return;
+      patchSession(sessionId, { data: { youtubeDescription } });
 
       // 4. Tạo SEO Tags Viral (<400 ký tự)
-      setGenerationStep('Đang tạo bộ thẻ SEO tags tối ưu...');
+      setStep('Đang tạo bộ thẻ SEO tags tối ưu...');
       const seoTags = await generateSeoTags(storyContext, targetLang);
+      if (!alive()) return;
+      patchSession(sessionId, { status: 'done', step: undefined, data: { seoTags } });
 
-      const now = new Date();
-      const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(
-        now.getMinutes()
-      ).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')} • ${now.getDate()}/${
-        now.getMonth() + 1
-      }/${now.getFullYear()}`;
-
-      // Create new session result
-      const newResult: GenerationResult = {
-        id: `session-${Date.now()}`,
-        timestamp: timeStr,
-        originalText: inputText,
-        youtubeUrl,
-        youtubeVideoId: videoId || undefined,
-        youtubeOriginalTitle: originalTitle || undefined,
-        youtubeTranslatedTitle: translatedTitle || undefined,
-        thumbnailUrl: videoId ? getYouTubeThumbnails(videoId).maxRes : undefined,
-        targetLanguage: targetLang.id,
-        chunks: [],
-        fullTranslation,
-        youtubeDescription,
-        seoTags,
-      };
-
-      setCurrentResult(newResult);
-
-      // Add to session history
-      const titleSnippet =
-        translatedTitle ||
-        inputText.slice(0, 32).replace(/\n/g, ' ') + (inputText.length > 32 ? '...' : '');
-
-      const newSessionItem: SessionItem = {
-        id: newResult.id,
-        title: titleSnippet || 'Phiên dịch mới',
-        timestamp: timeStr,
-        createdAt: Date.now(),
-        data: newResult,
-      };
-
-      const updatedSessions = [newSessionItem, ...sessions];
-      saveSessions(updatedSessions);
-      setCurrentSessionId(newSessionItem.id);
-
-      showToast('Đã tạo thành công toàn bộ nội dung!');
+      showToast(
+        isViewing()
+          ? 'Đã tạo thành công toàn bộ nội dung!'
+          : `Phiên "${titleOf()}" đã hoàn thành!`
+      );
     } catch (err: any) {
       console.error('Generation failed:', err);
-      showToast(err.message || 'Có lỗi xảy ra trong quá trình tạo nội dung.');
-    } finally {
-      setIsGenerating(false);
-      setGenerationStep('');
+      const msg = err?.message || 'Có lỗi xảy ra trong quá trình tạo nội dung.';
+      if (!alive()) return;
+      patchSession(sessionId, { status: 'error', step: undefined, error: msg });
+      showToast(isViewing() ? msg : `Phiên "${titleOf()}" bị lỗi: ${msg}`);
     }
   };
 
@@ -421,6 +494,7 @@ export default function App() {
         onSelectSession={handleSelectSession}
         onNewSession={handleNewSession}
         onDeleteSession={handleDeleteSession}
+        onRenameSession={handleRenameSession}
         onClearAll={handleClearAllSessions}
         isCollapsed={isSidebarCollapsed}
         onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
@@ -593,6 +667,18 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {/* Thông báo lỗi của phiên đang xem */}
+          {currentSession?.status === 'error' && (
+            <div className="p-4 rounded-2xl bg-red-50 border border-red-200 text-sm text-red-700 leading-relaxed">
+              ⚠️ {currentSession.error || 'Có lỗi xảy ra trong quá trình tạo nội dung.'}
+              {currentResult && (currentResult.fullTranslation || currentResult.youtubeTranslatedTitle) && (
+                <span className="block mt-1 text-xs text-red-600/80">
+                  Các phần đã hoàn thành trước khi lỗi vẫn được giữ lại bên dưới.
+                </span>
+              )}
+            </div>
+          )}
 
           {/* Generated Results Area */}
           {currentResult && (
